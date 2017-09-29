@@ -21,7 +21,7 @@ setup(
             'psycopg2',
             'pytest',
             'pytest-cov',
-            #'pydevd',
+            'flake8==3.4.1',
         ],
     },
     entry_points={
