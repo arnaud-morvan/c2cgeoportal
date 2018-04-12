@@ -1,4 +1,5 @@
 from functools import partial
+from pyramid.httpexceptions import HTTPFound, HTTPNotFound
 from pyramid.view import view_defaults
 from pyramid.view import view_config
 
@@ -7,6 +8,7 @@ from zope.sqlalchemy import mark_changed
 
 from c2cgeoform.schema import GeoFormSchemaNode
 from c2cgeoform.views.abstract_views import ListField, ItemAction
+from deform import ValidationFailure
 from deform.widget import FormWidget
 
 from c2cgeoportal_admin import _
@@ -66,9 +68,9 @@ class LayerWmtsViews(DimensionLayerViews):
                 icon='glyphicon icon-l_wmts',
                 url=self._request.route_url(
                     'convert_to_wms',
-                    id=getattr(item, self._id_field)),
-                method='POST',
-                confirmation=_('Are you sure you want to convert this layer to WMS ?')))
+                    id=getattr(item, self._id_field)
+                )
+            ))
         return actions
 
     @view_config(route_name='c2cgeoform_item',
@@ -100,48 +102,104 @@ class LayerWmtsViews(DimensionLayerViews):
     def duplicate(self):
         return super().duplicate()
 
-    @view_config(route_name='convert_to_wms',
-                 request_method='POST',
-                 renderer='json')
-    def convert_to_wms(self):
-        src = self._get_object()
-        dbsession = self._request.dbsession
-        default_wms = LayerWMS.get_default(dbsession)
-        values = {
-            'ogc_server_id': default_wms.ogc_server_id,
-            'time_mode': default_wms.time_mode,
-            'time_widget': default_wms.time_widget
-        } if default_wms else {
-            'ogc_server_id': dbsession.query(OGCServer.id).order_by(OGCServer.id).first()[0],
-            'time_mode': 'disabled',
-            'time_widget': 'slider'
-        }
-        with dbsession.no_autoflush:
-            d = delete(LayerWMTS.__table__)
-            d = d.where(LayerWMTS.__table__.c.id == src.id)
-            i = insert(LayerWMS.__table__)
-            values.update({
-                'id': src.id,
-                'layer': src.layer,
-                'style': src.style
-            })
-            i = i.values(values)
-            u = update(TreeItem.__table__)
-            u = u.where(TreeItem.__table__.c.id == src.id)
-            u = u.values({'type': 'l_wms'})
-            dbsession.execute(d)
-            dbsession.execute(i)
-            dbsession.execute(u)
-            dbsession.expunge(src)
+    def _convert_to_wmts_form(self):
+        return self._form(title=_('Convert WMS layer to WMTS layer'))
 
-        dbsession.flush()
-        mark_changed(dbsession)
+    @view_config(route_name='convert_to_wmts',
+                 request_method='GET',
+                 match_param='table=layers_wms',
+                 renderer='../templates/edit.jinja2')
+    def convert_to_wmts_edit(self):
+        obj = self._request.dbsession.query(LayerWMS).get(self._request.matchdict.get('id'))
+        if obj is None:
+            raise HTTPNotFound()
+
+        form = self._convert_to_wmts_form()
+
+        dict_ = {}
+        default_wmts = LayerWMTS.get_default(self._request.dbsession)
+        if default_wmts:
+            dict_.update({
+                'url': default_wmts.url,
+                'matrix_set': default_wmts.matrix_set
+            })
+        dict_.update(form.schema.dictify(obj))
+        dict_.update({
+            'image_type': obj.ogc_server.image_type,
+        })
+
+        self._populate_widgets(form.schema)
+        rendered = form.render(dict_,
+                               request=self._request,
+                               actions=[])
 
         return {
-            'success': True,
-            'redirect': self._request.route_url(
-                'c2cgeoform_item',
-                table='layers_wms',
-                id=self._request.matchdict['id'],
-                _query=[('msg_col', 'submit_ok')])
+            'form': rendered,
+            'deform_dependencies': form.get_widget_resources()
         }
+
+    @view_config(route_name='convert_to_wmts',
+                 request_method='POST',
+                 match_param='table=layers_wms',
+                 renderer='../templates/edit.jinja2')
+    def convert_to_wmts_save(self):
+        src = self._request.dbsession.query(LayerWMS).get(self._request.matchdict.get('id'))
+        if src is None:
+            raise HTTPNotFound()
+
+        try:
+            form = self._convert_to_wmts_form()
+            form_data = self._request.POST.items()
+            self._appstruct = form.validate(form_data)
+
+            dbsession = self._request.dbsession
+            with dbsession.no_autoflush:
+                d = delete(LayerWMS.__table__)
+                d = d.where(LayerWMS.__table__.c.id == src.id)
+                i = insert(LayerWMTS.__table__)
+                i = i.values({
+                    'id': src.id,
+                    'layer': src.layer,
+                    'image_type': src.ogc_server.image_type,
+                    'style': src.style,
+                    'url': '',
+                    'matrix_set': ''
+                })
+                u = update(TreeItem.__table__)
+                u = u.where(TreeItem.__table__.c.id == src.id)
+                u = u.values({'type': 'l_wmts'})
+                dbsession.execute(d)
+                dbsession.execute(i)
+                dbsession.execute(u)
+                dbsession.expunge(src)
+
+                dbsession.flush()
+                mark_changed(dbsession)
+
+            obj = dbsession.query(LayerWMTS).get(src.id)
+
+            with self._request.dbsession.no_autoflush:
+                obj = form.schema.objectify(self._appstruct, obj)
+
+            self._obj = self._request.dbsession.merge(obj)
+            self._request.dbsession.flush()
+            return HTTPFound(
+                self._request.route_url(
+                    'c2cgeoform_item',
+                    table='layers_wmts',
+                    action='edit',
+                    id=obj.id,
+                    _query=[('msg_col', 'submit_ok')]))
+
+        except ValidationFailure as e:
+            # FIXME see https://github.com/Pylons/deform/pull/243
+            self._populate_widgets(form.schema)
+            rendered = e.field.widget.serialize(
+                e.field,
+                e.cstruct,
+                request=self._request,
+                actions=[])
+            return {
+                'form': rendered,
+                'deform_dependencies': form.get_widget_resources()
+            }
