@@ -118,6 +118,7 @@ else:  # pragma: no cover
 
 def cache_invalidate_cb(*args):
     caching.invalidate_region()
+    log.warning('Cache invalidated: {}'.format(args))
 
 
 class TsVector(UserDefinedType):
